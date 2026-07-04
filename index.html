@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>A-F 听音选图 · 有道发音版</title>
+<title>A-F 听音选图 · 完美修复版</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
   body {
@@ -262,10 +262,9 @@ let audioPlayer = null;
 let isPlaying = false;
 
 // ============================================================
-//  激活音频上下文（解决移动端/线上环境自动播放策略）
+//  激活音频上下文（通用）
 // ============================================================
 let audioCtx = null;
-
 function ensureAudioContext() {
   try {
     if (!audioCtx) {
@@ -276,20 +275,18 @@ function ensureAudioContext() {
     }
     return audioCtx.state === 'running';
   } catch(e) {
-    console.warn("AudioContext not supported");
     return false;
   }
 }
 
 // ============================================================
-//  有道词典在线发音（美式发音 type=2）
-//  英式发音 type=1
+//  播放有道发音（优化版）
 // ============================================================
 function playYoudaoAudio(word, callback) {
-  // 先确保音频上下文激活
+  // 先激活音频上下文
   ensureAudioContext();
 
-  // 如果正在播放，先取消
+  // 取消之前的播放
   if (audioPlayer) {
     audioPlayer.pause();
     audioPlayer.currentTime = 0;
@@ -297,27 +294,23 @@ function playYoudaoAudio(word, callback) {
   }
 
   const audioUrl = `https://dict.youdao.com/dictvoice?audio=${encodeURIComponent(word)}&type=2`;
-
   const audio = new Audio(audioUrl);
   audioPlayer = audio;
 
-  // 在播放前先加载（确保资源就绪）
-  audio.load();
+  // 关键：立即调用 play()，即使资源未完全加载
+  // 这样浏览器会认为播放是在当前手势上下文中触发的
+  audio.play().catch(err => {
+    console.warn("首次播放被阻止，等待加载后重试", err);
+    // 如果立即播放失败，等待 canplaythrough 再试
+    audio.oncanplaythrough = function() {
+      audio.play().catch(e => {
+        console.error("重试播放失败", e);
+        if (callback) callback();
+      });
+    };
+  });
 
-  audio.oncanplaythrough = function() {
-    // 资源可播放时，尝试播放
-    audio.play().catch(err => {
-      console.warn("播放被阻止:", err);
-      // 重试一次
-      setTimeout(() => {
-        audio.play().catch(err2 => {
-          console.error("重试播放失败:", err2);
-          if (callback) callback();
-        });
-      }, 300);
-    });
-  };
-
+  // 事件监听
   audio.onended = function() {
     audioPlayer = null;
     isPlaying = false;
@@ -325,19 +318,17 @@ function playYoudaoAudio(word, callback) {
   };
 
   audio.onerror = function(e) {
-    console.warn("美式发音加载失败，尝试英式降级", e);
+    console.warn("美式发音错误，尝试英式降级", e);
     audioPlayer = null;
     isPlaying = false;
-    // 降级：英式发音 type=1
+    // 降级英式
     const fallbackUrl = `https://dict.youdao.com/dictvoice?audio=${encodeURIComponent(word)}&type=1`;
     const fallbackAudio = new Audio(fallbackUrl);
     audioPlayer = fallbackAudio;
-    fallbackAudio.load();
-    fallbackAudio.oncanplaythrough = function() {
-      fallbackAudio.play().catch(err => {
-        if (callback) callback();
-      });
-    };
+    fallbackAudio.play().catch(err => {
+      // 降级也失败
+      if (callback) callback();
+    });
     fallbackAudio.onended = function() {
       audioPlayer = null;
       isPlaying = false;
@@ -346,20 +337,12 @@ function playYoudaoAudio(word, callback) {
     fallbackAudio.onerror = function() {
       audioPlayer = null;
       isPlaying = false;
-      document.getElementById('statusBar').textContent = '⚠️ 发音加载失败，请检查网络';
+      document.getElementById('statusBar').textContent = '⚠️ 发音失败，请检查网络';
       if (callback) callback();
     };
-    // 如果降级也无法播放，直接回调
-    setTimeout(() => {
-      if (audioPlayer === fallbackAudio) {
-        audioPlayer = null;
-        isPlaying = false;
-        if (callback) callback();
-      }
-    }, 5000);
   };
 
-  // 如果加载超时（5秒），强制回调
+  // 超时兜底
   setTimeout(() => {
     if (audioPlayer === audio) {
       audioPlayer = null;
@@ -431,40 +414,77 @@ function showQuestion() {
   });
 }
 
-// 播放发音（点击喇叭）
+// ============================================================
+//  播放发音（点击喇叭）—— 修复核心
+// ============================================================
 function playSound() {
   if (isPlaying) return;
   isPlaying = true;
 
-  // 先激活音频上下文（关键！）
+  // 1. 先激活音频上下文
   ensureAudioContext();
 
-  const btn = document.getElementById('listenBtn');
-  const q = questions[currentQ];
-  btn.classList.add('playing', 'loading');
-  document.getElementById('wordDisplay').textContent = '🔊 加载中...';
-  document.getElementById('statusBar').textContent = '⏳ 正在获取有道发音...';
-
-  playYoudaoAudio(q.word, () => {
-    btn.classList.remove('playing', 'loading');
-    isPlaying = false;
-    document.getElementById('statusBar').textContent = '✅ 发音完成';
-    if (!answered) {
-      document.getElementById('wordDisplay').textContent = '🔊 选一张图片吧！';
-    }
-  });
-
-  // 安全兜底
-  setTimeout(() => {
-    btn.classList.remove('playing', 'loading');
-    isPlaying = false;
-    if (!answered) {
-      document.getElementById('statusBar').textContent = '⏳ 若未听到，请检查网络后重试';
-    }
-  }, 6000);
+  // 2. 播放一个极短的静音音频，建立手势上下文（关键步骤）
+  try {
+    // 使用一个无声的 WAV 数据（Base64 编码的静音）
+    const silentAudio = new Audio('data:audio/wav;base64,UklGRkoAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoAAACBhYqLkZOUlZaVlJORjYuIhIOCgXx4d3Z1c3N0dHZ3eHp7fH5+gIKDhIWHiIqLjI2OjpCPkZGSkpOTlJWWl5iZmpucnZ6fn6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fr7/P3+/w==');
+    silentAudio.volume = 0; // 静音
+    silentAudio.play().then(() => {
+      // 静音播放成功，随后播放真正的发音
+      setTimeout(() => {
+        const btn = document.getElementById('listenBtn');
+        const q = questions[currentQ];
+        btn.classList.add('playing', 'loading');
+        document.getElementById('wordDisplay').textContent = '🔊 加载中...';
+        document.getElementById('statusBar').textContent = '⏳ 正在获取有道发音...';
+        playYoudaoAudio(q.word, () => {
+          btn.classList.remove('playing', 'loading');
+          isPlaying = false;
+          document.getElementById('statusBar').textContent = '✅ 发音完成';
+          if (!answered) {
+            document.getElementById('wordDisplay').textContent = '🔊 选一张图片吧！';
+          }
+        });
+      }, 80);
+    }).catch(() => {
+      // 如果静音播放失败，直接尝试播放发音（降级）
+      setTimeout(() => {
+        const btn = document.getElementById('listenBtn');
+        const q = questions[currentQ];
+        btn.classList.add('playing', 'loading');
+        document.getElementById('wordDisplay').textContent = '🔊 加载中...';
+        document.getElementById('statusBar').textContent = '⏳ 尝试播放...';
+        playYoudaoAudio(q.word, () => {
+          btn.classList.remove('playing', 'loading');
+          isPlaying = false;
+          document.getElementById('statusBar').textContent = '✅ 发音完成';
+          if (!answered) {
+            document.getElementById('wordDisplay').textContent = '🔊 选一张图片吧！';
+          }
+        });
+      }, 80);
+    });
+  } catch(e) {
+    // 如果静音音频创建失败，直接播放
+    const btn = document.getElementById('listenBtn');
+    const q = questions[currentQ];
+    btn.classList.add('playing', 'loading');
+    document.getElementById('wordDisplay').textContent = '🔊 加载中...';
+    document.getElementById('statusBar').textContent = '⏳ 正在获取有道发音...';
+    playYoudaoAudio(q.word, () => {
+      btn.classList.remove('playing', 'loading');
+      isPlaying = false;
+      document.getElementById('statusBar').textContent = '✅ 发音完成';
+      if (!answered) {
+        document.getElementById('wordDisplay').textContent = '🔊 选一张图片吧！';
+      }
+    });
+  }
 }
 
-// 检查答案
+// ============================================================
+//  检查答案
+// ============================================================
 function checkAnswer(btn, idx) {
   if (answered) return;
   answered = true;
@@ -529,16 +549,10 @@ function showResult() {
 // 启动游戏
 startGame();
 
-// 页面任意点击激活音频上下文
+// 全局点击激活音频上下文
 document.addEventListener('click', function() {
   ensureAudioContext();
 }, { once: false, passive: true });
-
-// 额外：页面加载完成后也尝试激活一次（但通常需要用户手势）
-window.addEventListener('load', function() {
-  // 尝试静默激活（可能无效，但无害）
-  ensureAudioContext();
-});
 </script>
 </body>
 </html>
